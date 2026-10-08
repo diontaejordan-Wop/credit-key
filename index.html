@@ -1921,62 +1921,55 @@
   var MT_RANK_WEIGHTS = [6, 3.5, 2, 1, 0.5];
   function mtWeights(order){ var w = {}; order.forEach(function(key,i){ w[key] = MT_RANK_WEIGHTS[i]; }); return w; }
 
+  // Cards where you pick ONE bonus category (e.g. BofA Customized Cash): only one of the person's
+  // categories can earn the bonus rate; the rest earn the base rate.
+  var CHOICE_CATEGORY_CARDS = {'bofa-customized-secured': {cats:['gas','restaurant','travel','shopping'], bonus:3}};
+  function cardRateFor(card, cats){
+    if(!cats.length) return card.baseRate;
+    var choice = CHOICE_CATEGORY_CARDS[card.id];
+    var used = false;
+    var rates = cats.map(function(cat){
+      if(choice && choice.cats.indexOf(cat) > -1){
+        if(used) return card.baseRate;
+        used = true; return choice.bonus;
+      }
+      return card.categoryRates[cat];
+    });
+    return rates.reduce(function(a,b){return a+b;},0) / rates.length;
+  }
+  function norm5(v, min, max, invert){
+    if(!(max>min)) return 0; // no difference between cards → this priority can't separate them
+    var x = Math.max(0, Math.min(1, (v-min)/(max-min))); return (invert ? 1-x : x) * 5;
+  }
+
+  /* Card matching = (1) preferences  ×  (2) background fit  ×  (3) bank relationship.
+     (1) Each priority is scored 0–5 relative to the other cards and weighted by the person's ranking.
+     (2) Background only removes or reduces cards that are a poor fit or hard to get approved for —
+         it never adds a blanket bonus, so the person's priorities decide among cards they can get.
+     (3) Cards from a bank they already use get a lift, since an existing relationship helps approval. */
   function computeCardMatches(inputs){
     var cards = CARDS_REAL.map(function(c){ return Object.assign({}, c); });
+    var incomeTier = INCOME_TIER[inputs.income] || 'mid';
+    var under21 = inputs.age && inputs.age < 21;
+    // Pass 1: background fit (2) and bank relationship (3) for every card.
     cards.forEach(function(card){
-      if(!inputs.categories.length){ card._blendedRate = card.baseRate; }
-      else{
-        var rates = inputs.categories.map(function(cat){ return card.categoryRates[cat]; });
-        card._blendedRate = rates.reduce(function(a,b){return a+b;},0) / rates.length;
-      }
-    });
-    var rates = cards.map(function(c){ return c._blendedRate; });
-    var minRate = Math.min.apply(null, rates), maxRate = Math.max.apply(null, rates);
-    var aprs = cards.map(function(c){ return c.aprApprox; });
-    var minApr = Math.min.apply(null, aprs), maxApr = Math.max.apply(null, aprs);
-    var fees = cards.map(function(c){ return c.annualFee||0; });
-    var minFee = Math.min.apply(null, fees), maxFee = Math.max.apply(null, fees);
-    var weights = mtWeights(inputs.rankOrder);
-
-    cards.forEach(function(card){
-      var cashScore = maxRate>minRate ? ((card._blendedRate-minRate)/(maxRate-minRate))*5 : 2.5;
-      var aprScore = maxApr>minApr ? (1-((card.aprApprox-minApr)/(maxApr-minApr)))*5 : 2.5;
-      // Normalized like APR: if every card has the same fee (today all are $0) this adds nothing, rather than
-      // a flat bonus that would drown out the person's other priorities.
-      var feeScore = maxFee>minFee ? (1-((card.annualFee-minFee)/(maxFee-minFee)))*5 : 0;
-      var limitScore = card.creditLimitScore;
-      var buildScore = card.creditBuildingScore;
-      var contributions = {
-        fee: weights.fee*feeScore, apr: weights.apr*aprScore,
-        cashback: weights.cashback*cashScore, limit: weights.limit*limitScore, building: weights.building*buildScore
-      };
-      var total = 0; Object.keys(contributions).forEach(function(k){ total += contributions[k]; });
-
-      var incomeTier = INCOME_TIER[inputs.income] || 'mid';
+      card._blendedRate = cardRateFor(card, inputs.categories || []);
+      // (2) Background fit
       var mult = 1;
-      if(card.studentOnly && !inputs.isStudent) mult *= 0.12;
+      if(card.studentOnly) mult *= inputs.isStudent ? 1.05 : 0.12;
       if(card.secured){
-        if(inputs.history==='none') mult *= 1.25;
-        if(inputs.history==='established') mult *= 0.65;
-        if(inputs.isStudent) mult *= 0.85;
+        if(inputs.history==='established') mult *= 0.7;   // no need to tie up a deposit
+        if(inputs.isStudent) mult *= 0.95;
       }
-      if(card.cashFlowUnderwritten){
-        if(inputs.history==='none' && !inputs.isStudent) mult *= 1.3;
-        if(inputs.isStudent) mult *= 0.9;
-      }
+      if(card.id==='chase-freedom-rise' && inputs.history==='established') mult *= 0.85;
       if(card.id==='chase-freedom-unlimited'){
         if(inputs.history==='none') mult *= 0.35;
         else if(inputs.history==='limited') mult *= 0.7;
-        else if(inputs.history==='established') mult *= 1.25;
+        else mult *= 1.1;
         if(incomeTier==='none' || incomeTier==='low') mult *= 0.65;
       }
-      if(card.id==='chase-freedom-rise' && inputs.history==='established') mult *= 0.85;
-      if(card.secured && inputs.history==='limited') mult *= 1.1;
-
-      // Background: income and age. Petal approves on income/cash flow, so it needs some income;
-      // unsecured cards are much harder with no income, especially under 21 (CARD Act requires
-      // independent income or a co-signer).
-      var under21 = inputs.age && inputs.age < 21;
+      // Income: Petal approves on income/cash flow; unsecured cards are hard with no income,
+      // especially under 21 (CARD Act: independent income or a co-signer).
       if(incomeTier==='none'){
         if(card.cashFlowUnderwritten) mult *= 0.45;
         if(!card.secured) mult *= under21 ? 0.7 : 0.8;
@@ -1984,15 +1977,47 @@
         mult *= 0.95;
       }
 
-      // Banking: an existing relationship with the issuer genuinely helps approval odds.
+      // (3) Banking relationship
       var primaryHit = isRealBankPref(inputs.bankPrimary) && bankFuzzyMatch(inputs.bankPrimary, card.issuer);
       var secondaryHit = !primaryHit && isRealBankPref(inputs.bankSecondary) && bankFuzzyMatch(inputs.bankSecondary, card.issuer);
       card._bankHit = primaryHit ? 'primary' : (secondaryHit ? 'secondary' : null);
-      if(card.membershipRequired && !card._bankHit) mult *= 0.35; // members already qualify — no penalty for them
-      if(primaryHit) mult *= 1.25;
-      else if(secondaryHit) mult *= 1.12;
-      if(card._bankHit && card.id==='chase-freedom-rise') mult *= 1.12; // Rise approvals favor existing Chase customers
+      if(card.membershipRequired && !card._bankHit) mult *= 0.25; // members already qualify — no penalty for them
+      if(primaryHit) mult *= 1.3;
+      else if(secondaryHit) mult *= 1.15;
+      if(card._bankHit && card.id==="chase-freedom-rise") mult *= 1.05; // Rise approvals favor existing Chase customers
 
+      card._mult = mult;
+    });
+    // Which priorities can actually tell apart the cards this person could realistically get.
+    var pool = cards.filter(function(c){ return c._mult >= 0.5; });
+    if(pool.length < 3) pool = cards;
+    function range(f){ var v = pool.map(f); return [Math.min.apply(null,v), Math.max.apply(null,v)]; }
+    var rR = range(function(c){ return c._blendedRate; }), aR = range(function(c){ return c.aprApprox; }),
+        fR = range(function(c){ return c.annualFee||0; }), lR = range(function(c){ return c.creditLimitScore; }),
+        bR = range(function(c){ return c.creditBuildingScore; });
+    // A priority that can't separate the cards (e.g. every card has a $0 annual fee) is skipped, and the
+    // person's next priorities move up — so their real #1 and #2 still carry the most weight.
+    var spans = {fee:fR, apr:aR, cashback:rR, limit:lR, building:bR};
+    var activeOrder = inputs.rankOrder.filter(function(k){ return spans[k] && spans[k][1] > spans[k][0]; });
+    var weights = mtWeights(activeOrder);
+    inputs.rankOrder.forEach(function(k){ if(!(k in weights)) weights[k] = 0; });
+
+    // Pass 2: preference score (1), then combine.
+    cards.forEach(function(card){
+      // Fixed, absolute scales (not relative to whichever cards happen to be in the list), so a small
+      // difference never gets blown up into a big one: APR 18%→5 … 30%→0, cash back 0%→0 … 4%+→5,
+      // annual fee $0→5 … $100+→0, limit/credit-building ratings 1→0 … 5→5.
+      var norms = {
+        fee: norm5(card.annualFee||0, 0, 100, true), apr: norm5(card.aprApprox, 18, 30, true),
+        cashback: norm5(card._blendedRate, 0, 4), limit: norm5(card.creditLimitScore, 1, 5),
+        building: norm5(card.creditBuildingScore, 1, 5)
+      };
+      var contributions = {};
+      Object.keys(norms).forEach(function(k){ contributions[k] = (weights[k]||0) * norms[k]; });
+      card._norms = norms;
+      var total = 1; Object.keys(contributions).forEach(function(k){ total += contributions[k]; });
+
+      var mult = card._mult;
       card._raw = total * mult;
       card._contributions = contributions;
     });
@@ -2005,6 +2030,11 @@
     });
 
     cards.sort(function(a,b){ return b._raw - a._raw; });
+    // Banking guarantee: if the person's own bank has a card that fits them but it didn't make the top 5
+    // on points, show its best one as #5 so their bank is always represented.
+    var bankIdx = -1;
+    for(var bi=0; bi<cards.length; bi++){ if(cards[bi]._bankHit && cards[bi]._mult >= 0.6){ bankIdx = bi; break; } }
+    if(bankIdx > 4){ var pick = cards.splice(bankIdx, 1)[0]; pick._bankPick = true; cards.splice(4, 0, pick); }
     var topRaw = cards[0]._raw || 1;
     cards.forEach(function(c){ c._matchPct = Math.max(1, Math.round((c._raw/topRaw)*100)); });
     cards.forEach(function(c){ c._explain = explainCardReal(c, inputs); c.source = 'local'; });
@@ -2015,8 +2045,15 @@
   function explainCardReal(card, inputs){
     var entries = Object.keys(card._contributions).map(function(k){ return [k, card._contributions[k]]; });
     entries.sort(function(a,b){ return b[1]-a[1]; });
-    var top2 = entries.filter(function(e){ return e[1] > 0; }).slice(0,2).map(function(e){ return e[0]; });
-    if(!top2.length) top2 = ['building'];
+    // Only credit a card for priorities it's actually good at (at least middle of the scale).
+    var top2 = entries.filter(function(e){ return e[1] > 0 && card._norms && card._norms[e[0]] >= 2.5; }).slice(0,2).map(function(e){ return e[0]; });
+    if(!top2.length){
+      var weak = 'It\'s a realistic option for your background, but it isn\'t a standout on your top priorities.';
+      var out = weak;
+      if(card._bankPick) out = 'Included as the best fit from your bank, ' + String(card._bankHit==='primary' ? inputs.bankPrimary : inputs.bankSecondary).trim() + ' — an existing relationship can help approval. ' + weak;
+      else if(card._bankHit) out += ' Bonus: you bank with ' + String(card._bankHit==='primary' ? inputs.bankPrimary : inputs.bankSecondary).trim() + ', which can help approval.';
+      return out;
+    }
     var parts = top2.map(function(key){
       if(key==='cashback'){
         var catNames = inputs.categories.map(function(c){ return c.charAt(0).toUpperCase()+c.slice(1); }).join(' and ');
@@ -2026,7 +2063,8 @@
     });
     var line = 'Scored where it did mainly because ' + parts.join(', and ') + '.';
     if(inputs.rankOrder[0]==='fee' && maxFeeAll()===0) line += ' (Every card here has a $0 annual fee, so fees didn\'t separate them.)';
-    if(card._bankHit) line += ' Bonus: you bank with ' + String(card._bankHit==='primary' ? inputs.bankPrimary : inputs.bankSecondary).trim() + ', which can help approval.';
+    if(card._bankPick) line = 'Included as the best fit from your bank, ' + String(card._bankHit==='primary' ? inputs.bankPrimary : inputs.bankSecondary).trim() + ' — an existing relationship can help approval. ' + line;
+    else if(card._bankHit) line += ' Bonus: you bank with ' + String(card._bankHit==='primary' ? inputs.bankPrimary : inputs.bankSecondary).trim() + ', which can help approval.';
     else if(card.membershipRequired) line += ' Requires membership, so it ranks lower unless you already bank there.';
     if(card.cashFlowUnderwritten && (INCOME_TIER[inputs.income]==='none')) line += ' Approval leans on income, so it\'s a tougher fit with no income right now.';
     return line;
@@ -2318,7 +2356,7 @@
       'with no credit history, secured and new-to-credit cards fit best; with no income, unsecured cards are hard to get ' +
       '(under 21 the CARD Act requires independent income or a co-signer) and cards that approve on income/cash flow ' +
       '(Petal) are a weak fit; an existing relationship with the issuer helps approval (Chase Freedom Rise especially ' +
-      'favors existing Chase customers). Mention the bank or background factor in the reasoning when it moved the score.\n\n' +
+      'favors existing Chase customers). Their #1 priority should matter most, then #2, and so on; if a priority is identical across cards (e.g. every card has a $0 annual fee) skip it and use the next one. For rewards, match their spending categories to each card\'s category rates, remembering the Bank of America card earns its bonus in only ONE category they choose. An existing bank relationship should lift that bank\'s cards noticeably, but not above a clearly better fit for their #1 priority. Mention the bank or background factor in the reasoning when it moved the score.\n\n' +
       'Respond fast with ONLY a JSON array covering every id in the catalog above (any order), no markdown fences, ' +
       'no commentary before or after. Each object must have exactly these fields:\n' +
       '{"id": "must exactly match a catalog id — never a new one", ' +
@@ -2359,6 +2397,11 @@
       return card;
     });
     cards.sort(function(a,b){ return b._score10 - a._score10; });
+    // Same banking guarantee as local scoring: keep the best-fitting card from their bank in the top 5.
+    var fit = {}; computeCardMatches(mt).forEach(function(c){ fit[c.id] = c; });
+    var bIdx = -1;
+    for(var i=0;i<cards.length;i++){ var f = fit[cards[i].id]; if(f && f._bankHit && f._mult >= 0.6){ bIdx = i; break; } }
+    if(bIdx > 4){ var bp = cards.splice(bIdx,1)[0]; bp._explain = 'Included as the best fit from your bank — an existing relationship can help approval. ' + bp._explain; cards.splice(4,0,bp); }
     return {source:'ai', cards: cards, generatedAt: Date.now()};
   }
 
@@ -2542,7 +2585,7 @@
   }
   // Best-of-your-bank suggestions: looks at the bank(s) entered on "Tell us about you" (falling back to
   // the issuer typed on any manually-added card, so the tip still works before someone runs a match),
-  // and surfaces the lowest-APR real cards from that bank that aren't already in the wallet.
+  // and surfaces that bank's best-fit cards for this person (by their match when they've run one).
   function bestCardsForBank(){
     var mt = S.profile.matchTool || {};
     var banks = [mt.bankPrimary, mt.bankSecondary].filter(isRealBankPref);
@@ -2552,10 +2595,17 @@
     if(!banks.length) return {banks: [], cards: []};
     var seen = {};
     banks = banks.filter(function(b){ var n = normBank(b); if(seen[n]) return false; seen[n]=true; return true; });
-    var matches = CARDS_REAL.filter(function(card){
-      return banks.some(function(b){ return bankFuzzyMatch(b, card.issuer); });
-    });
-    matches.sort(function(a,b){ return a.aprApprox - b.aprApprox; });
+    var fromBank = function(card){ return banks.some(function(b){ return bankFuzzyMatch(b, card.issuer); }); };
+    var matches;
+    if(mt.submittedAt && mt.categories && mt.rankOrder){
+      // Rank this bank's cards by the person's own match (priorities + background + bank), and leave out
+      // ones that are a poor fit for them (e.g. student-only cards for a non-student).
+      matches = computeCardMatches(mt).filter(function(c){ return fromBank(c) && c._mult >= 0.5; });
+    } else {
+      var student = !!(mt.isStudent || S.profile.isStudent);
+      matches = CARDS_REAL.filter(function(c){ return fromBank(c) && (!c.studentOnly || student); });
+      matches.sort(function(a,b){ return a.aprApprox - b.aprApprox; });
+    }
     return {banks: banks, cards: matches.slice(0,3)};
   }
   function walletSuggestionsHTML(){
